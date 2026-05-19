@@ -18,6 +18,7 @@ A long-term emotional memory system for Claude. Tags memories using Russell's va
 - 【二次开发】**自动记忆注入**：每轮请求由 Gateway 先召回 `Core Memory / Recent Context / Recalled Memory`，再拼入隐藏 system message 转发给上游模型。
 - 【二次开发】**Persona State Engine**：新增 `persona_state.db`，按全局人格、关系状态和会话心情维护当前状态，并通过 `X-Ombre-Session-Id` 让多个客户端窗口共享连续状态。
 - 【二次开发】**召回冷却与短期去重**：新增 `gateway_state.db`，记录每个 session 最近注入过的 bucket，配合 `skip_recent_rounds / cooldown_hours / cooldown_floor` 降低同一条记忆反复贴脸的概率。
+- 【二次开发】**Memory Edge 与 edge-aware breath**：写入普通记忆后可生成显式关系边；MCP `breath()` 和 Gateway 召回都会沿一跳强关系带出相关记忆摘要。
 - 【二次开发】**多上游模型路由**：支持 `gateway.upstreams` 配多个 OpenAI-compatible provider，`/v1/models` 聚合模型列表，聊天请求按 `model` 自动路由。
 - 【二次开发】**工具调用与流式兼容**：透传 `tools / tool_choice / parallel_tool_calls / tool_calls / tool` 消息，支持 SSE 流式响应，并补齐部分 DeepSeek 工具续写场景里的 `reasoning_content`。
 - 【二次开发】**Supabase 同步与写入 API**：新增 `scripts/sync_to_supabase.py`、`scripts/supabase_memory_rpc.sql` 和认证写入接口，方便把 Ombre 本地桶与外部记忆表双向同步。
@@ -257,6 +258,9 @@ Ombre Brain gives it persistent memory — not cold key-value storage, but a sys
 - **权重池浮现 / Weight pool surfacing**: 记忆不是被动检索的，它们会主动浮现——未解决的、情绪强烈的记忆权重更高，会在对话开头自动推送。
   Memories aren't just passively retrieved — they actively surface. Unresolved, emotionally intense memories carry higher weight and get pushed at conversation start.
 
+- **显式关系边 / Explicit memory edges**: 普通记忆写入后可生成 `updates / supports / blocks / emotional_echo` 等关系边。`breath()` 会从本次实际浮现或检索命中的记忆继续带出一跳相关记忆，让记忆不只是相似，而是有前因后续。
+  New memories can grow explicit relationship edges such as `updates`, `supports`, `blocks`, and `emotional_echo`. `breath()` can include one-hop related memories from the memories that actually surfaced or matched.
+
 - **记忆重构 / Memory reconstruction**: 检索时根据当前情绪状态微调记忆的 valence 展示值（±0.1），模拟人类"此刻的心情影响对过去的回忆"的认知偏差。
   During retrieval, memory valence display is subtly shifted (±0.1) based on current mood, simulating the human cognitive bias of "current mood colors past memories".
 
@@ -283,11 +287,13 @@ python gateway.py
 - `POST /v1/chat/completions`
 - `POST /v1/messages`（Anthropic Messages 形状，当前支持非流式文本）
 
-这个网关会在转发到上游模型前自动注入四段上下文：
+这个网关会在转发到上游模型前自动注入多段上下文：
 - `Current Inner State`：上一轮回复后留下的人格、情绪和关系状态
 - `Core Memory`：`pinned / protected` 桶
+- `Relationship Weather`：最近的日印象 / 周印象 feel
 - `Recent Context`：最近 `72h` 内的普通记忆摘要
 - `Recalled Memory`：从关键词 + embedding 候选里挑出的 `0~2` 条动态记忆
+- `Related Memory`：`Recalled Memory` 的一跳强关系边和目标记忆摘要
 
 v1 已实现的召回约束：
 - 同一 `session` 最近 `5` 轮注入过的桶优先跳过
@@ -928,18 +934,21 @@ breath(query="今天很累")
     └────┬────┘
          │
     去重 + 合并
+         │
+    实际返回的记忆
+         │
+    memory_edges 一跳展开
+         │
     token 预算截断
          │
-    [语义关联] 标注 vector 来源
-         │
-    返回 ≤20 条结果
+    返回检索结果 + 关联记忆
 ```
 
 8 个 MCP 工具 / 8 MCP tools:
 
 | 工具 Tool | 作用 Purpose |
 |-----------|-------------|
-| `breath` | 浮现或检索记忆。无参数=推送未解决记忆；有参数=关键词+向量语义双通道检索。支持 domain/valence/arousal 过滤 / Surface or search memories. No args = surface unresolved; with query = keyword + vector dual-channel search. Supports domain/valence/arousal filters |
+| `breath` | 浮现或检索记忆。无参数=推送未解决记忆；有参数=关键词+向量语义双通道检索。支持 `include_related / related_per_memory / edge_min_confidence` 沿显式关系边带出一跳关联记忆；支持 `include_core / core_limit` 控制 pinned/protected 核心记忆数量 / Surface or search memories. Can include one-hop related memories from explicit edges and limit core pinned/protected memories |
 | `read_bucket` | 按 `bucket_id` 精确读取完整正文和元数据，不触碰 `last_active`，用于“我知道是哪一条，直接读这一条”的场景 / Exact full bucket read by id without refreshing activation |
 | `hold` | 存储单条记忆，自动打标+合并相似桶+生成 embedding。`feel=True` 写模型自己的感受 / Store a single memory with auto-tagging, merging, and embedding. `feel=True` for model's own reflections |
 | `grow` | 日记归档，自动拆分长内容为多个记忆桶，每个桶自动生成 embedding / Diary digest, auto-split into multiple buckets with embeddings |
@@ -1218,6 +1227,14 @@ Gateway 现在会额外注入：
 - 最近的 relationship weather
 - 每条召回记忆的一跳强关系边
 - 关系边指向的相关记忆摘要
+
+MCP `breath()` 也会读取同一份关系边：
+
+- 默认从本次实际返回的浮现/检索记忆展开一跳关联记忆
+- `include_related=False` 可关闭关联记忆
+- `related_per_memory` 控制每条源记忆最多带出的边数，默认 `1`
+- `edge_min_confidence` 控制最低置信度，默认 `0.55`
+- `include_core / core_limit` 控制核心准则展示，避免 pinned/protected 每次全量出现
 
 ### 对话启动完整流程 / Conversation Start Sequence
 ```

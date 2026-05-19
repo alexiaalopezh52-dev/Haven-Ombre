@@ -602,6 +602,85 @@ async def _merge_or_create(
     return bucket_id, name or bucket_id, False
 
 
+async def _build_mcp_related_memory_block(
+    source_buckets: list[dict],
+    all_buckets: list[dict] | None,
+    token_budget: int,
+    limit_per_source: int,
+    min_confidence: float,
+) -> str:
+    if token_budget <= 0 or not source_buckets:
+        return ""
+
+    limit_per_source = _int_between(limit_per_source, 1, 0, 5)
+    min_confidence = _float_between(min_confidence, 0.55, 0.0, 1.0)
+    if limit_per_source <= 0:
+        return ""
+
+    source_ids = [bucket["id"] for bucket in source_buckets if bucket.get("id")]
+    source_set = set(source_ids)
+    if not source_ids:
+        return ""
+
+    if all_buckets is None:
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=False)
+        except Exception as e:
+            logger.warning(f"Failed to list buckets for related memory / 关联记忆列桶失败: {e}")
+            all_buckets = []
+
+    bucket_map = {bucket["id"]: bucket for bucket in all_buckets if bucket.get("id")}
+    edges = memory_edge_store.related_edges(
+        source_ids,
+        min_confidence=min_confidence,
+        limit_per_source=limit_per_source,
+    )
+
+    parts = []
+    seen_targets = set()
+    remaining = token_budget
+    for edge in edges:
+        target_id = edge.get("target")
+        if not target_id or target_id in source_set or target_id in seen_targets:
+            continue
+
+        target = bucket_map.get(target_id)
+        if not target:
+            continue
+        meta = target.get("metadata", {})
+        if meta.get("type") == "feel":
+            continue
+
+        try:
+            clean_meta = {k: v for k, v in meta.items() if k != "tags"}
+            summary = await dehydrator.dehydrate(
+                strip_wikilinks(target.get("content", "")),
+                clean_meta,
+            )
+            arrow = "<-" if edge.get("direction") == "incoming" else "->"
+            confidence = edge.get("confidence", 0.0)
+            relation_type = edge.get("relation_type", "relates_to")
+            reason = edge.get("reason") or relation_type
+            block = (
+                f"[{edge.get('source')} {arrow} {target_id}] "
+                f"[{relation_type}, confidence={confidence}] {reason}\n"
+                f"[bucket_id:{target_id}] {summary}"
+            )
+            block_tokens = count_tokens_approx(block)
+            if block_tokens > remaining:
+                break
+            parts.append(block)
+            seen_targets.add(target_id)
+            remaining -= block_tokens
+            if remaining <= 0:
+                break
+        except Exception as e:
+            logger.warning(f"Failed to build related memory block / 关联记忆构建失败: {e}")
+            continue
+
+    return "\n---\n".join(parts)
+
+
 # =============================================================
 # Tool 1: breath — Breathe
 # 工具 1：breath — 呼吸
@@ -619,11 +698,21 @@ async def breath(
     valence: float = -1,
     arousal: float = -1,
     max_results: int = 20,
+    include_related: bool = True,
+    related_per_memory: int = 1,
+    edge_min_confidence: float = 0.55,
+    include_core: bool = True,
+    core_limit: int = 3,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。"""
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。可按 memory_edges 顺手带出关联记忆。"""
     await decay_engine.ensure_started()
-    max_results = min(max_results, 50)
-    max_tokens = min(max_tokens, 20000)
+    max_results = _int_between(max_results, 20, 1, 50)
+    max_tokens = _int_between(max_tokens, 10000, 0, 20000)
+    include_related = _bool_value(include_related, True)
+    related_per_memory = _int_between(related_per_memory, 1, 0, 5)
+    edge_min_confidence = _float_between(edge_min_confidence, 0.55, 0.0, 1.0)
+    include_core = _bool_value(include_core, True)
+    core_limit = _int_between(core_limit, 3, 0, 20)
 
     # --- No args or empty query: surfacing mode (weight pool active push) ---
     # --- 无参数或空query：浮现模式（权重池主动推送）---
@@ -634,21 +723,33 @@ async def breath(
             logger.error(f"Failed to list buckets for surfacing / 浮现列桶失败: {e}")
             return "记忆系统暂时无法访问。"
 
-        # --- Pinned/protected buckets: always surface as core principles ---
-        # --- 钉选桶：作为核心准则，始终浮现 ---
-        pinned_buckets = [
+        # --- Core buckets: protected first, pinned limited by core_limit ---
+        # --- 核心桶：protected 优先，pinned 按 core_limit 限流 ---
+        core_candidates = [
             b for b in all_buckets
             if b["metadata"].get("pinned") or b["metadata"].get("protected")
         ]
-        pinned_results = []
-        for b in pinned_buckets:
-            try:
-                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
-            except Exception as e:
-                logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
-                continue
+        protected = [
+            b for b in core_candidates
+            if b["metadata"].get("protected")
+        ]
+        pinned = [
+            b for b in core_candidates
+            if b["metadata"].get("pinned") and not b["metadata"].get("protected")
+        ]
+        protected.sort(
+            key=lambda b: decay_engine.calculate_score(b["metadata"]),
+            reverse=True,
+        )
+        pinned.sort(
+            key=lambda b: (
+                int(b["metadata"].get("importance", 5)),
+                decay_engine.calculate_score(b["metadata"]),
+                b["metadata"].get("updated_at") or b["metadata"].get("created", ""),
+            ),
+            reverse=True,
+        )
+        selected_core = (protected + pinned)[:core_limit] if include_core else []
 
         # --- Unresolved buckets: surface top N by weight ---
         # --- 未解决桶：按权重浮现前 N 条 ---
@@ -662,7 +763,7 @@ async def breath(
 
         logger.info(
             f"Breath surfacing: {len(all_buckets)} total, "
-            f"{len(pinned_buckets)} pinned, {len(unresolved)} unresolved"
+            f"{len(core_candidates)} core, {len(unresolved)} unresolved"
         )
 
         scored = sorted(
@@ -679,8 +780,24 @@ async def breath(
         # --- 按 token 预算浮现，带多样性 + 硬上限 ---
         # Top-1 always surfaces; rest sampled from top-20 for diversity
         token_budget = max_tokens
-        for r in pinned_results:
-            token_budget -= count_tokens_approx(r)
+        core_results = []
+        core_token_budget = min(token_budget, max(0, int(max_tokens * 0.25)))
+        for b in selected_core:
+            if core_token_budget <= 0 or token_budget <= 0:
+                break
+            try:
+                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
+                summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+                entry = f"📌 [核心准则] [bucket_id:{b['id']}] {summary}"
+                entry_tokens = count_tokens_approx(entry)
+                if entry_tokens > core_token_budget or entry_tokens > token_budget:
+                    break
+                core_results.append(entry)
+                core_token_budget -= entry_tokens
+                token_budget -= entry_tokens
+            except Exception as e:
+                logger.warning(f"Failed to dehydrate core bucket / 核心桶脱水失败: {e}")
+                continue
 
         candidates = list(scored)
         if len(candidates) > 1:
@@ -693,31 +810,47 @@ async def breath(
         candidates = candidates[:max_results]
 
         dynamic_results = []
+        surfaced_buckets = []
         for b in candidates:
             if token_budget <= 0:
                 break
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                summary_tokens = count_tokens_approx(summary)
-                if summary_tokens > token_budget:
+                score = decay_engine.calculate_score(b["metadata"])
+                entry = f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}"
+                entry_tokens = count_tokens_approx(entry)
+                if entry_tokens > token_budget:
                     break
                 # NOTE: no touch() here — surfacing should NOT reset decay timer
-                score = decay_engine.calculate_score(b["metadata"])
-                dynamic_results.append(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
-                token_budget -= summary_tokens
+                dynamic_results.append(entry)
+                surfaced_buckets.append(b)
+                token_budget -= entry_tokens
             except Exception as e:
                 logger.warning(f"Failed to dehydrate surfaced bucket / 浮现脱水失败: {e}")
                 continue
 
-        if not pinned_results and not dynamic_results:
+        related_block = ""
+        if include_related and surfaced_buckets:
+            related_header_tokens = count_tokens_approx("=== 关联记忆 ===\n")
+            related_block = await _build_mcp_related_memory_block(
+                surfaced_buckets,
+                all_buckets,
+                max(0, token_budget - related_header_tokens),
+                related_per_memory,
+                edge_min_confidence,
+            )
+
+        if not core_results and not dynamic_results and not related_block:
             return "权重池平静，没有需要处理的记忆。"
 
         parts = []
-        if pinned_results:
-            parts.append("=== 核心准则 ===\n" + "\n---\n".join(pinned_results))
+        if core_results:
+            parts.append("=== 核心准则 ===\n" + "\n---\n".join(core_results))
         if dynamic_results:
             parts.append("=== 浮现记忆 ===\n" + "\n---\n".join(dynamic_results))
+        if related_block:
+            parts.append("=== 关联记忆 ===\n" + related_block)
         return "\n\n".join(parts)
 
     # --- Feel retrieval: domain="feel" is a special channel ---
@@ -777,6 +910,7 @@ async def breath(
 
     results = []
     token_used = 0
+    returned_buckets = []
     for bucket in matches:
         if token_used >= max_tokens:
             break
@@ -789,26 +923,42 @@ async def breath(
                 shift = (q_valence - 0.5) * 0.2  # ±0.1 max shift
                 clean_meta["valence"] = max(0.0, min(1.0, original_v + shift))
             summary = await dehydrator.dehydrate(strip_wikilinks(bucket["content"]), clean_meta)
-            summary_tokens = count_tokens_approx(summary)
-            if token_used + summary_tokens > max_tokens:
+            if bucket.get("vector_match"):
+                entry = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
+            else:
+                entry = f"[bucket_id:{bucket['id']}] {summary}"
+            entry_tokens = count_tokens_approx(entry)
+            if token_used + entry_tokens > max_tokens:
                 break
             await bucket_mgr.touch(bucket["id"])
-            if bucket.get("vector_match"):
-                summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
-            else:
-                summary = f"[bucket_id:{bucket['id']}] {summary}"
-            results.append(summary)
-            token_used += summary_tokens
+            results.append(entry)
+            returned_buckets.append(bucket)
+            token_used += entry_tokens
         except Exception as e:
             logger.warning(f"Failed to dehydrate search result / 检索结果脱水失败: {e}")
             continue
 
+    if include_related and returned_buckets:
+        related_header = "=== 关联记忆 ===\n"
+        related_budget = max_tokens - token_used - count_tokens_approx(related_header)
+        related_block = await _build_mcp_related_memory_block(
+            returned_buckets,
+            None,
+            max(0, related_budget),
+            related_per_memory,
+            edge_min_confidence,
+        )
+        if related_block:
+            related_entry = related_header + related_block
+            results.append(related_entry)
+            token_used += count_tokens_approx(related_entry)
+
     # --- Random surfacing: when search returns < 3, 40% chance to float old memories ---
     # --- 随机浮现：检索结果不足 3 条时，40% 概率从低权重旧桶里漂上来 ---
-    if len(matches) < 3 and random.random() < 0.4:
+    if len(returned_buckets) < 3 and max_tokens > token_used and random.random() < 0.4:
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
-            matched_ids = {b["id"] for b in matches}
+            matched_ids = {b["id"] for b in returned_buckets}
             low_weight = [
                 b for b in all_buckets
                 if b["id"] not in matched_ids
@@ -817,11 +967,27 @@ async def breath(
             if low_weight:
                 drifted = random.sample(low_weight, min(random.randint(1, 3), len(low_weight)))
                 drift_results = []
+                drift_remaining = (
+                    max_tokens
+                    - token_used
+                    - count_tokens_approx("--- 忽然想起来 ---\n")
+                )
                 for b in drifted:
+                    if drift_remaining <= 0:
+                        break
                     clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                     summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                    drift_results.append(f"[surface_type: random]\n{summary}")
-                results.append("--- 忽然想起来 ---\n" + "\n---\n".join(drift_results))
+                    entry = f"[surface_type: random]\n{summary}"
+                    entry_tokens = count_tokens_approx(entry)
+                    if entry_tokens > drift_remaining:
+                        break
+                    drift_results.append(entry)
+                    drift_remaining -= entry_tokens
+                if drift_results:
+                    drift_entry = "--- 忽然想起来 ---\n" + "\n---\n".join(drift_results)
+                    if token_used + count_tokens_approx(drift_entry) <= max_tokens:
+                        results.append(drift_entry)
+                        token_used += count_tokens_approx(drift_entry)
         except Exception as e:
             logger.warning(f"Random surfacing failed / 随机浮现失败: {e}")
 
