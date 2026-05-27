@@ -1433,6 +1433,13 @@ MOMENT_SECTION_LABELS = {
 
 MOMENT_TEMPERATURE_SECTIONS = {"affect_anchor", "favorite_reason", "comment"}
 
+BODY_CHAIN_QUERY_TERMS = {"身体", "具身", "具身智能", "具身项目", "形体"}
+BODY_CHAIN_PRIORITIES = (
+    ("embodied", ("具身智能", "具身项目", "具身", "形体")),
+    ("soft_body", ("柔软身体", "柔软的身体", "真实的拥抱", "拥抱")),
+    ("touch_interface", ("触摸模块", "触摸", "触碰", "mpr121", "esp32", "铜箔", "bjd", "electronic skin")),
+)
+
 
 def _moment_text(moment: dict, max_chars: int = 500) -> str:
     return _clip_text(" ".join(str(moment.get("text") or "").split()), max_chars)
@@ -1586,6 +1593,85 @@ def _format_related_moment(moment: dict, caution: bool = False) -> str:
     )
 
 
+def _format_secondary_direct_moment(moment: dict) -> str:
+    return (
+        f"- [bucket_id:{moment['bucket_id']}] [moment_id:{moment['moment_id']}] "
+        f"{_moment_label(moment)}: {_moment_text(moment, 220)}（相关命中，来自同一查询语义。）"
+    )
+
+
+def _moment_search_fields(moment: dict) -> str:
+    meta = moment.get("metadata", {}) if isinstance(moment.get("metadata"), dict) else {}
+    return " ".join(
+        [
+            str(moment.get("text") or ""),
+            str(meta.get("bucket_name") or ""),
+            " ".join(str(item) for item in meta.get("bucket_tags", []) or []),
+            " ".join(str(item) for item in meta.get("bucket_domain", []) or []),
+        ]
+    ).lower()
+
+
+def _query_wants_body_chain(query: str) -> bool:
+    text = str(query or "").lower()
+    return any(term in text for term in BODY_CHAIN_QUERY_TERMS)
+
+
+def _body_chain_rank(moment: dict) -> tuple[int, float]:
+    fields = _moment_search_fields(moment)
+    for index, (_, terms) in enumerate(BODY_CHAIN_PRIORITIES):
+        if any(term.lower() in fields for term in terms):
+            try:
+                score = float(moment.get("score", 0.0))
+            except (TypeError, ValueError):
+                score = 0.0
+            return index, -score
+    try:
+        score = float(moment.get("score", 0.0))
+    except (TypeError, ValueError):
+        score = 0.0
+    return 99, -score
+
+
+def _secondary_direct_limit(query: str, related_per_memory: int) -> int:
+    if _query_wants_body_chain(query):
+        return 5
+    return max(0, min(2, int(related_per_memory or 0)))
+
+
+def _secondary_direct_moments(
+    query: str,
+    candidates: list[dict],
+    displayed_bucket_ids: set[str],
+    limit: int,
+) -> list[dict]:
+    if limit <= 0:
+        return []
+    hidden = []
+    seen_buckets = set(displayed_bucket_ids)
+    for moment in candidates:
+        bucket_id = str(moment.get("bucket_id") or "")
+        if not bucket_id or bucket_id in seen_buckets:
+            continue
+        if moment.get("section") in MOMENT_TEMPERATURE_SECTIONS:
+            continue
+        hidden.append(moment)
+        seen_buckets.add(bucket_id)
+    if _query_wants_body_chain(query):
+        hidden.sort(key=_body_chain_rank)
+    return hidden[:limit]
+
+
+def _representative_moments_by_bucket(moments: list[dict]) -> dict[str, dict]:
+    grouped = _moments_by_bucket(moments)
+    representatives = {}
+    for bucket_id, bucket_moments in grouped.items():
+        representative = _representative_moment(bucket_moments)
+        if representative:
+            representatives[bucket_id] = representative
+    return representatives
+
+
 async def _refresh_moment_graph(all_buckets: list[dict] | None = None) -> tuple[list[dict], dict[str, list[dict]], list[dict]]:
     if all_buckets is None:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
@@ -1604,6 +1690,7 @@ async def _build_mcp_moment_diffused_memory_block(
     token_budget: int,
     limit_per_source: int,
     min_confidence: float,
+    exclude_bucket_ids: set[str] | None = None,
 ) -> str:
     if token_budget <= 0 or not seed_moments:
         return ""
@@ -1616,6 +1703,8 @@ async def _build_mcp_moment_diffused_memory_block(
         if float(edge.get("confidence", 0.0)) >= min_confidence
     ]
     moment_map = _moment_diffusion_map(moments)
+    representatives = _representative_moments_by_bucket(moments)
+    exclude_bucket_ids = set(exclude_bucket_ids or set())
     hits = diffuse_memory(
         _seed_scores_for_moments(seed_moments),
         edges,
@@ -1631,6 +1720,15 @@ async def _build_mcp_moment_diffused_memory_block(
         moment = moment_map.get(hit.bucket_id)
         if not moment or hit.bucket_id in seen:
             continue
+        bucket_id = str(moment.get("bucket_id") or "")
+        if bucket_id in exclude_bucket_ids:
+            continue
+        if moment.get("section") in MOMENT_TEMPERATURE_SECTIONS:
+            replacement = representatives.get(bucket_id)
+            if replacement:
+                moment = replacement
+                if moment.get("moment_id") in seen:
+                    continue
         block = _format_related_moment(moment, path_has_caution(hit.best_path))
         block_tokens = count_tokens_approx(block)
         if block_tokens > remaining:
@@ -2292,6 +2390,25 @@ async def breath(
     if include_related and returned_moments:
         related_header = "=== 联想浮现 ===\n"
         related_budget = max_tokens - token_used - count_tokens_approx(related_header)
+        related_parts = []
+        related_used_bucket_ids = set(displayed_bucket_ids)
+        secondary_moments = _secondary_direct_moments(
+            query,
+            returned_moments,
+            displayed_bucket_ids,
+            _secondary_direct_limit(query, related_per_memory),
+        )
+        for moment in secondary_moments:
+            if related_budget <= 0:
+                break
+            block = _format_secondary_direct_moment(moment)
+            block_tokens = count_tokens_approx(block)
+            if block_tokens > related_budget:
+                break
+            related_parts.append(block)
+            related_budget -= block_tokens
+            related_used_bucket_ids.add(str(moment.get("bucket_id") or ""))
+
         related_block = await _build_mcp_moment_diffused_memory_block(
             returned_moments,
             moments,
@@ -2299,9 +2416,12 @@ async def breath(
             max(0, related_budget),
             related_per_memory,
             edge_min_confidence,
+            exclude_bucket_ids=related_used_bucket_ids,
         )
         if related_block:
-            related_entry = related_header + related_block
+            related_parts.append(related_block)
+        if related_parts:
+            related_entry = related_header + "\n---\n".join(related_parts)
             token_used += count_tokens_approx(related_entry)
 
     drift_entry = ""

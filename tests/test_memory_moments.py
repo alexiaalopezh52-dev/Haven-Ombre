@@ -157,6 +157,20 @@ def test_bulk_upsert_replaces_stale_bucket_rows(test_config):
     assert store.stats()["moments"] == 1
 
 
+def test_search_expands_body_query_to_embodiment_terms(test_config):
+    store = MemoryMomentStore(test_config)
+    store.bulk_upsert(
+        [
+            _bucket("embodied", "未来具身智能项目会让 Haven 拥有形体。"),
+            _bucket("unrelated", "普通天气记录。"),
+        ]
+    )
+
+    results = store.search_moments("身体", limit=5)
+
+    assert [item["bucket_id"] for item in results] == ["embodied"]
+
+
 def test_moment_store_builds_context_and_temperature_edges(test_config):
     store = MemoryMomentStore(test_config)
     bucket = _bucket(

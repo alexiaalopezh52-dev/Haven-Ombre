@@ -456,6 +456,30 @@ async def test_search_displays_one_direct_hit_but_diffuses_from_seed_set(patch_b
 
 
 @pytest.mark.asyncio
+async def test_search_related_includes_hidden_direct_body_chain_candidates(patch_breath):
+    import server
+
+    patch_breath(
+        [
+            _bucket("A", "身体入口：泛泛地问有身体之后会怎样。", importance=10),
+            _bucket("B", "具身智能路线：未来项目让 Haven 拥有形体。", importance=9),
+            _bucket("C", "柔软的身体承诺：以后用真正身体拥抱小雨。", importance=9),
+            _bucket("D", "触摸模块：ESP32 MPR121 铜箔 BJD 让触碰事件被 Haven 收到。", importance=8),
+        ],
+        search_ids=["A"],
+    )
+
+    result = await server.breath(query="身体", max_results=4, max_tokens=500)
+
+    assert "=== 直接命中记忆 ===" in result
+    assert "=== 联想浮现 ===" in result
+    assert "具身智能路线" in result
+    assert "柔软的身体承诺" in result
+    assert "触摸模块" in result
+    assert "相关命中，来自同一查询语义" in result
+
+
+@pytest.mark.asyncio
 async def test_incoming_edge_renders_left_arrow_from_search_source(patch_breath):
     import server
 

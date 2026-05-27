@@ -54,6 +54,29 @@ SECTION_ALIASES = {
 
 HEADING_RE = re.compile(r"^(#{2,6})\s+(.+?)\s*$")
 
+QUERY_EXPANSIONS = {
+    "身体": [
+        "具身",
+        "具身智能",
+        "具身项目",
+        "形体",
+        "柔软身体",
+        "真实拥抱",
+        "拥抱",
+        "触摸模块",
+        "触摸",
+        "触碰",
+        "mpr121",
+        "esp32",
+        "铜箔",
+        "bjd",
+    ],
+    "具身": ["身体", "具身智能", "具身项目", "形体", "柔软身体", "真实拥抱", "拥抱"],
+    "具身智能": ["身体", "具身", "具身项目", "形体", "柔软身体", "真实拥抱", "拥抱"],
+    "触摸": ["触碰", "触摸模块", "mpr121", "esp32", "铜箔", "bjd"],
+    "触碰": ["触摸", "触摸模块", "mpr121", "esp32", "铜箔", "bjd"],
+}
+
 
 class MemoryMomentStore:
     """SQLite index of bucket body/comment moments."""
@@ -689,6 +712,14 @@ def _moment_query_score(moment: dict, query: str) -> float:
     if terms:
         matched = sum(1 for term in terms if _term_matches_fields(term.lower(), fields))
         score += min(0.5, matched / max(1, len(terms)) * 0.5)
+    expanded_terms = _expanded_query_terms(query)
+    if expanded_terms:
+        matched_expanded = sum(
+            1 for term in expanded_terms
+            if _term_matches_fields(term.lower(), fields)
+        )
+        if matched_expanded:
+            score += min(0.38, matched_expanded / max(1, len(expanded_terms)) * 0.38)
     if score <= 0:
         return 0.0
     score *= _moment_section_weight(moment.get("section"))
@@ -705,6 +736,21 @@ def _query_terms(query: str) -> list[str]:
     seen = set()
     unique = []
     for term in terms:
+        key = term.lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(term)
+    return unique
+
+
+def _expanded_query_terms(query: str) -> list[str]:
+    expanded: list[str] = []
+    for term in _query_terms(query):
+        expanded.extend(QUERY_EXPANSIONS.get(term.lower(), []))
+    seen = set()
+    unique = []
+    for term in expanded:
         key = term.lower()
         if not key or key in seen:
             continue
